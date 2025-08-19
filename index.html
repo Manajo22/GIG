@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Body-Star Catcher</title>
+  <style>
+    html,body{height:100%;margin:0;background:#000;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Helvetica,Arial,sans-serif}
+    #app{position:fixed;inset:0;overflow:hidden;background:#000}
+    canvas{position:absolute;inset:0;width:100%;height:100%;}
+    video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);opacity:0.4;background:#000;}
+    .hud{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;padding:12px 16px;pointer-events:none}
+    .pill{background:rgba(0,0,0,.5);padding:8px 12px;border-radius:999px;border:1px solid rgba(255,255,255,.2)}
+    .score{font-weight:700;}
+    .btnbar{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+    button{pointer-events:auto;appearance:none;background:#111;color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:16px;padding:14px 18px;font-size:16px;font-weight:700;cursor:pointer;}
+    .hint{position:absolute;bottom:16px;left:0;right:0;text-align:center;opacity:.8;font-size:14px}
+    .banner{position:absolute;top:64px;left:50%;transform:translateX(-50%);max-width:min(92vw,720px);text-align:center}
+    .status{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+    .tracker{position:absolute;top:0;left:50%;transform:translateX(-50%);height:100%;width:60%;border:2px dashed rgba(255,255,255,0.4);pointer-events:none;}
+    .tracker::before{content:"Step back until torso fits inside this box";position:absolute;top:8px;left:50%;transform:translateX(-50%);font-size:14px;background:rgba(0,0,0,0.6);padding:4px 8px;border-radius:6px;}
+  </style>
+</head>
+<body>
+  <div id="app">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="canvas"></canvas>
+    <div class="tracker" id="tracker"></div>
+
+    <div class="hud">
+      <div class="pill score">Score: <span id="score">0</span> / 5</div>
+    </div>
+
+    <div class="banner">
+      <div class="title">Body-Star Catcher ⭐</div>
+      <div class="subtitle">Step back until your torso is visible inside the box, then collect stars with your hands.</div>
+    </div>
+
+    <div class="btnbar" id="gate">
+      <button id="start">Enable Camera & Start</button>
+    </div>
+
+    <div class="status" id="status" style="display:none">
+      <div class="pill">🔎 Positioning</div>
+      <div class="msg" id="statusMsg">Step back so at least your torso is visible…</div>
+    </div>
+
+    <div class="hint">Privacy: video stays on your device; only landmarks are used for the game.</div>
+  </div>
+
+  <script type="module">
+    import {
+      FilesetResolver,
+      PoseLandmarker
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.12/vision_bundle.mjs";
+
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const startBtn = document.getElementById('start');
+    const scoreEl = document.getElementById('score');
+    const statusEl = document.getElementById('status');
+    const statusMsg = document.getElementById('statusMsg');
+    const gate = document.getElementById('gate');
+    const tracker = document.getElementById('tracker');
+
+    let landmarker;
+    let game = { mode:'idle', star:null, collected:0, maxStars:5 };
+
+    function resize(){
+      const {innerWidth:w, innerHeight:h, devicePixelRatio:dpr=1} = window;
+      canvas.width=w*dpr; canvas.height=h*dpr;
+      canvas.style.width=w+'px'; canvas.style.height=h+'px';
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+    }
+    window.addEventListener('resize',resize); resize();
+
+    function spawnStar(){
+      const w=canvas.width/(window.devicePixelRatio||1);
+      const h=canvas.height/(window.devicePixelRatio||1);
+      const r=Math.max(50,Math.min(w,h)*0.06);
+      const edges=['top','right','bottom','left'];
+      const edge=edges[Math.floor(Math.random()*edges.length)];
+      let x,y;
+      if(edge==='top'){x=Math.random()*w;y=r;}
+      if(edge==='bottom'){x=Math.random()*w;y=h-r;}
+      if(edge==='left'){x=r;y=Math.random()*h;}
+      if(edge==='right'){x=w-r;y=Math.random()*h;}
+      game.star={x,y,r};
+    }
+
+    function drawStar(x,y,r){
+      ctx.save(); ctx.translate(x,y); ctx.fillStyle='#fff';
+      ctx.shadowColor='#fff'; ctx.shadowBlur=25;
+      ctx.beginPath();
+      const spikes=5, outer=r, inner=r*0.5;
+      let rot=Math.PI/2*3; let cx=0,cy=0;
+      ctx.moveTo(cx,cy-outer);
+      for(let i=0;i<spikes;i++){
+        cx=Math.cos(rot)*outer; cy=Math.sin(rot)*outer; ctx.lineTo(cx,cy); rot+=Math.PI/5;
+        cx=Math.cos(rot)*inner; cy=Math.sin(rot)*inner; ctx.lineTo(cx,cy); rot+=Math.PI/5;
+      }
+      ctx.lineTo(0,-outer); ctx.closePath(); ctx.fill(); ctx.restore();
+    }
+
+    function isTorsoVisible(landmarks){
+      if(!landmarks||landmarks.length<23) return false;
+      const nose=landmarks[0];
+      const hip=landmarks[23];
+      return nose && hip && nose.y<hip.y*0.9;
+    }
+
+    function drawHands(lm){
+  const w=canvas.width/(window.devicePixelRatio||1);
+  const h=canvas.height/(window.devicePixelRatio||1);
+  // Mirror hand X coordinates to match mirrored video
+  const L=(i)=>({x:w - (lm[i].x*w), y:lm[i].y*h});
+  const left=L(16), right=L(15);
+  [left,right].forEach(p=>{
+    ctx.beginPath();ctx.arc(p.x,p.y,18,0,Math.PI*2);
+    ctx.fillStyle='rgba(147,197,253,0.8)';ctx.fill();
+  });
+  return {left,right};
+}
+
+
+    function handsTouchStar(hands){
+      if(!game.star) return false;
+      const {x,y,r}=game.star;
+      const touchR=r+30;
+      const d2=(p)=> (p.x-x)**2+(p.y-y)**2;
+      return d2(hands.left)<touchR**2 || d2(hands.right)<touchR**2;
+    }
+
+    async function init(){
+      const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'},audio:false});
+      video.srcObject=stream; await video.play();
+
+      const vision=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.12/wasm");
+      landmarker=await PoseLandmarker.createFromOptions(vision,{
+        baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",delegate:'GPU'},
+        runningMode:'VIDEO',numPoses:1
+      });
+
+      game.mode='positioning'; statusEl.style.display='block'; tracker.style.display='block';
+      requestAnimationFrame(loop);
+    }
+
+    function loop(){
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      let landmarks=null;
+      if(landmarker&&video.readyState>=2){
+        const res=landmarker.detectForVideo(video,performance.now());
+        if(res&&res.landmarks.length>0){landmarks=res.landmarks[0];}
+      }
+
+      if(game.mode==='positioning'){
+        const ok=isTorsoVisible(landmarks);
+        statusMsg.textContent=ok?'Great! Starting…':'Step back until torso fits in the box';
+        if(ok){
+          setTimeout(()=>{if(game.mode==='positioning'){game.mode='playing';statusEl.style.display='none';tracker.style.display='none';spawnStar();}},700);
+        }
+      }
+
+      if(game.mode==='playing'){
+        if(!game.star) spawnStar();
+        drawStar(game.star.x,game.star.y,game.star.r);
+        const hands=drawHands(landmarks);
+        if(handsTouchStar(hands)){
+          game.collected++;scoreEl.textContent=game.collected;
+          game.star=null;
+          if(game.collected>=game.maxStars){game.mode='finished';}
+        }
+      }
+
+      if(game.mode==='finished'){
+        ctx.fillStyle='#fff';ctx.font='24px sans-serif';ctx.textAlign='center';
+        ctx.fillText('You caught all stars! Tap to restart',canvas.width/2,canvas.height/2);
+      }
+
+      requestAnimationFrame(loop);
+    }
+
+    canvas.addEventListener('click',()=>{if(game.mode==='finished'){game.collected=0;scoreEl.textContent=0;game.mode='positioning';statusEl.style.display='block';tracker.style.display='block';}});
+
+    startBtn.addEventListener('click',async()=>{startBtn.disabled=true;try{await init();gate.style.display='none';}catch(e){alert('Camera error');startBtn.disabled=false;}});
+  </script>
+</body>
+</html>
